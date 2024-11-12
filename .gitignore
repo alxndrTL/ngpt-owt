@@ -1,6 +1,7 @@
 *.pt
 args
 stat
+finished
 wandb/
 __pycache__/
 *.out
