@@ -66,9 +66,8 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_log = True # disabled by default
+wandb_project = 'ngpt-owt'
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 64 # used to simulate larger batch sizes
@@ -306,7 +305,7 @@ def get_lr(it):
 # logging
 if wandb_log and master_process:
     import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    wandb.init(project=wandb_project, config=config)
 
 # training loop
 #X, Y = get_batch('train') # fetch the very first batch

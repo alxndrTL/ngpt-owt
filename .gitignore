@@ -1,0 +1,7 @@
+*.pt
+args
+stat
+wandb/
+__pycache__/
+*.out
+*.bin
