@@ -1,0 +1,1 @@
+python -u ng_train.py --learning_rate=0.0018 --weight_decay=0.1 --warmup_iters=300 --n_layer=12 --n_head=6 --n_embd=768 --block_size=1024 --compile=True --batch_size=8 --gradient_accumulation_steps=64 --eval_iters=200 --max_iters=4000 --lr_decay_iters=4000 --min_lr=0.0 --eval_interval=100

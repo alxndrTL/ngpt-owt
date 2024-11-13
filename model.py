@@ -40,28 +40,33 @@ from torch.nn import functional as F
 import numpy as np
 from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
 
+class Rotary(torch.nn.Module):
 
-def apply_rotary_position_embeddings(sinusoidal_pos, q, k):
-    # Split the sinusoidal_pos into sin and cos parts
-    sin, cos = sinusoidal_pos.chunk(2, dim=-1)
-    # Apply the rotary embeddings to the query and key
-    q_rot = torch.stack((-q[..., 1::2], q[..., ::2]), dim=-1)
-    k_rot = torch.stack((-k[..., 1::2], k[..., ::2]), dim=-1)
-    q_rot = torch.reshape(q_rot, q.shape[:-1] + (q.shape[-1]//2, 2)) * torch.stack((cos, sin), dim=-1)
-    k_rot = torch.reshape(k_rot, k.shape[:-1] + (k.shape[-1]//2, 2)) * torch.stack((cos, sin), dim=-1)
-    q_rot = torch.reshape(q_rot, q.shape)
-    k_rot = torch.reshape(k_rot, k.shape)
-    return q_rot, k_rot
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.seq_len_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
 
-def get_sinusoidal_embeddings( n_positions, dim):
-    """Generate sinusoidal positional embeddings."""
-    position = torch.arange(n_positions, dtype=torch.float).unsqueeze(1)
-    div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
-    sinusoidal_emb = torch.zeros((n_positions, dim))
-    sinusoidal_emb[:, 0::2] = torch.sin(position * div_term)
-    sinusoidal_emb[:, 1::2] = torch.cos(position * div_term)
-    return sinusoidal_emb
+    def forward(self, x):
+        seq_len = x.shape[1]
+        if seq_len != self.seq_len_cached:
+            self.seq_len_cached = seq_len
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+            freqs = torch.outer(t, self.inv_freq).to(x.device)
+            self.cos_cached = freqs.cos().bfloat16()
+            self.sin_cached = freqs.sin().bfloat16()
+        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
 
+def apply_rotary_emb(x, cos, sin):
+    assert x.ndim == 4 # multihead attention
+    d = x.shape[3]//2
+    x1 = x[..., :d]
+    x2 = x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat([y1, y2], 3).type_as(x)
 
 class Block(nn.Module):
 
@@ -77,6 +82,8 @@ class Block(nn.Module):
         self.c_fc    = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=config.bias)
         self.silu    = nn.SiLU()
         self.mlp_c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+
+        self.rotary = Rotary(config.n_embd//config.n_head)
 
         if (config.use_nGPT == 0):
             self.rmsnorm_att = RMSNorm(config.n_embd)
@@ -105,11 +112,11 @@ class Block(nn.Module):
         res = x / x.norm(p=2, dim=-1, keepdim=True)
         return res
 
-    def forward(self, h):
-        B, T, C = h.size()
+    def forward(self, h_0):
+        B, T, C = h_0.size()
 
         if (self.config.use_nGPT == 0):
-            h = self.rmsnorm_att(h)
+            h = self.rmsnorm_att(h_0)
         
         q = self.query(h)
         k = self.key(h)
@@ -119,10 +126,8 @@ class Block(nn.Module):
         k = k.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
         v = v.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
 
-        sinusoidal_pos = get_sinusoidal_embeddings(T, self.config.n_embd // self.config.n_head).to(device=q.device)
-        q, k = apply_rotary_position_embeddings(sinusoidal_pos, q.transpose(1, 2), k.transpose(1, 2))
-        q = q.transpose(2, 1)
-        k = k.transpose(2, 1)
+        cos, sin = self.rotary(q)
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
 
         if (self.config.use_nGPT == 1):
             sqk = (self.sqk * (self.sqk_init_value/self.sqk_init_scaling)).view(1, 1, self.config.n_head, self.config.n_embd // self.config.n_head)
@@ -131,15 +136,19 @@ class Block(nn.Module):
 
         sqrt_head_dim = (self.config.n_embd / self.config.n_head) ** 0.5
         if (self.config.use_nGPT == 0): softmax_scale = 1.0 / sqrt_head_dim 
-        if (self.config.use_nGPT == 1): softmax_scale = sqrt_head_dim 
-        y = flash_attn_func(q.to(dtype=torch.bfloat16), k.to(dtype=torch.bfloat16), v.to(dtype=torch.bfloat16), dropout_p=0.0, softmax_scale=softmax_scale, causal=True, window_size=(-1, -1), alibi_slopes=None, deterministic=True)
-        y = y.to(dtype=q.dtype)
-        y = y.contiguous().view(B, T, self.config.n_embd)
+        if (self.config.use_nGPT == 1): softmax_scale = sqrt_head_dim
+
+        #y = flash_attn_func(q.to(dtype=torch.bfloat16), k.to(dtype=torch.bfloat16), v.to(dtype=torch.bfloat16), dropout_p=0.0, softmax_scale=softmax_scale, causal=True, window_size=(-1, -1), alibi_slopes=None, deterministic=True)
+        #y = y.to(dtype=q.dtype)
+        #y = y.contiguous().view(B, T, self.config.n_embd)
+        
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), scale=softmax_scale, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, self.config.n_embd)
 
         h_att = self.att_c_proj(y)
 
         if (self.config.use_nGPT == 0):
-            h = h + h_att
+            h_0 = h_0 + h_att
         if (self.config.use_nGPT == 1):
             lr = self.attn_alpha * (self.attn_alpha_init_value / self.attn_alpha_init_scaling)
             lr = torch.abs(lr)
@@ -153,7 +162,7 @@ class Block(nn.Module):
 
     
         if (self.config.use_nGPT == 0):
-            h = self.rmsnorm_mlp(h)
+            h = self.rmsnorm_mlp(h_0)
         uv = self.c_fc(h)
         if (self.config.use_nGPT == 1):
             suv = (self.suv * ((self.suv_init_value/self.suv_init_scaling) * (self.config.n_embd ** 0.5))) 
@@ -163,7 +172,7 @@ class Block(nn.Module):
         h_mlp = self.mlp_c_proj(x_mlp)
 
         if (self.config.use_nGPT == 0):
-            h = h + h_mlp
+            h = h_0 + h_mlp
         if (self.config.use_nGPT == 1):
             lr = self.mlp_alpha * (self.mlp_alpha_init_value / self.mlp_alpha_init_scaling)
             lr = torch.abs(lr)
@@ -189,6 +198,19 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = False 
 
+class RMSNorm(nn.Module):
+    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
+
+    def __init__(self, ndim):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.bias = None
+
+    def forward(self, input):
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+
+"""
 class RMSNorm(torch.nn.Module):
     def __init__(self, embdim: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -202,6 +224,7 @@ class RMSNorm(torch.nn.Module):
         xnorm = x * torch.rsqrt(norm + self.eps)
         xnorm = xnorm.to(dtype=dtype)
         return xnorm * self.weight
+"""
 
 
 class GPT(nn.Module):
